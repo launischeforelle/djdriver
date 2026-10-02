@@ -187,6 +187,7 @@ static void usage(const char *prog)
 		"      --ep-out HEX    override output endpoint (default 0x05)\n"
 		"      --ep-midi HEX   override MIDI input endpoint (default 0x83)\n"
 		"      --ep-pcm HEX    override audio input endpoint (default 0x86)\n"
+		"      --capture       also activate the audio input interface\n"
 		"  -h, --help          this help\n",
 		DJDRIVER_VERSION, prog, DEFAULT_PORT_NAME,
 		DJ2ME_VENDOR_ID, DJ2ME_PRODUCT_ID);
@@ -217,6 +218,7 @@ int main(int argc, char **argv)
 		{ "ep-out",  required_argument, NULL, 3 },
 		{ "ep-midi", required_argument, NULL, 4 },
 		{ "ep-pcm",  required_argument, NULL, 5 },
+		{ "capture", no_argument,       NULL, 6 },
 		{ "help",    no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
@@ -242,6 +244,7 @@ int main(int argc, char **argv)
 		case 3:   app->cfg.ep_out = (int)parse_num(optarg, 16); break;
 		case 4:   app->cfg.ep_midi_in = (int)parse_num(optarg, 16); break;
 		case 5:   app->cfg.ep_pcm_in = (int)parse_num(optarg, 16); break;
+		case 6:   app->cfg.capture = 1; break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 2;
 		}
@@ -262,7 +265,7 @@ int main(int argc, char **argv)
 	}
 
 	if (!strcmp(cmd, "probe") || !strcmp(cmd, "diag")) {
-		ret = !strcmp(cmd, "probe") ? dj_probe(ctx, &app->cfg) : dj_diag(ctx, &app->cfg, 500);
+		ret = !strcmp(cmd, "probe") ? dj_probe(ctx, &app->cfg) : dj_diag(ctx, &app->cfg);
 		libusb_exit(ctx);
 		return ret;
 	}
