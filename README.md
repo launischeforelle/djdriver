@@ -12,10 +12,17 @@ läuft. Reloop liefert seit Jahren keinen passenden Treiber mehr.
 
 ## Was der Treiber kann
 
+> **Hinweis zum DJ2 ME:** Tests an echter Hardware haben gezeigt, dass der
+> Controller abstürzt, sobald sein Audioteil gestartet wird (Streaming-Bit,
+> Samplerate-Anfragen, Interface 1). Der Treiber läuft deshalb standardmäßig
+> im **Nur-Eingabe-Modus**: Bedienelemente → DJ-Software funktionieren, die
+> LEDs bleiben aus. Für die LEDs gibt es `--leds` (kann den Controller zum
+> Absturz bringen).
+
 | Funktion | Status |
 | --- | --- |
 | Tasten, Fader, Drehregler, Jogwheels → DJ-Software (MIDI IN) | ✅ implementiert |
-| LEDs ← DJ-Software (MIDI OUT) | ✅ implementiert |
+| LEDs ← DJ-Software (MIDI OUT) | ⚠️ standardmäßig aus (`--leds`, experimentell) |
 | Automatisches Wiederverbinden beim Ab- und Anstecken (inkl. LED-Zustand) | ✅ |
 | Eingebaute Soundkarte (Audio-Ausgang/-Eingang) | ❌ noch nicht |
 

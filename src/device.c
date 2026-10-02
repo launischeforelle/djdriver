@@ -93,6 +93,7 @@ void dj_config_defaults(struct dj_config *cfg)
 	cfg->ep_midi_in = -1;
 	cfg->ep_pcm_in = -1;
 	cfg->capture = 0;
+	cfg->leds = 0;
 	cfg->verbose = 0;
 }
 
@@ -278,6 +279,9 @@ struct diag_ctx {
 	int midi_bytes;
 	uint8_t first_midi[16];
 	int first_midi_len;
+	struct midi_parser parser;
+	int live;		/* print MIDI messages as they arrive */
+	int raw_bytes;		/* all bytes seen on EP 0x83, filler included */
 };
 
 static double diag_ms(const struct diag_ctx *d)
@@ -336,8 +340,23 @@ static void LIBUSB_CALL diag_cb(struct libusb_transfer *t)
 	} else if (t->endpoint == PT_EP_MIDI_IN) {
 		size_t n = pt_midi_in_strip(t->buffer, (size_t)t->actual_length), k;
 
+		d->raw_bytes += t->actual_length;
 		d->midi_done++;
 		d->midi_bytes += (int)n;
+		if (d->live) {
+			int len;
+
+			for (k = 0; k < n; k++) {
+				len = midi_parser_feed(&d->parser, t->buffer[k]);
+				if (len > 0) {
+					printf("[%7.1f ms]   MIDI from controller:", diag_ms(d));
+					for (int j = 0; j < len; j++)
+						printf(" %02X", d->parser.msg[j]);
+					printf("\n");
+					fflush(stdout);
+				}
+			}
+		}
 		for (k = 0; k < n && d->first_midi_len < (int)sizeof(d->first_midi); k++)
 			d->first_midi[d->first_midi_len++] = t->buffer[k];
 	} else {
@@ -375,42 +394,22 @@ static void diag_stop_streams(libusb_context *ctx, struct diag_ctx *d)
 	d->nxfers = 0;
 }
 
-/* Stream for @secs seconds and report what moved; true if data flowed */
-static bool diag_measure(libusb_context *ctx, struct diag_ctx *d, int secs)
-{
-	int out0 = d->out_done, midi0 = d->midi_done, i;
-
-	printf("[%7.1f ms] streaming for %d s - PRESS BUTTONS / MOVE FADERS NOW\n",
-	       diag_ms(d), secs);
-	fflush(stdout);
-	for (i = 0; i < secs * 10 && !d->xfer_err; i++)
-		diag_wait(ctx, 100);
-	printf("[%7.1f ms]   output transfers %d, MIDI transfers %d, MIDI bytes so far %d, "
-	       "transfer error %d\n", diag_ms(d), d->out_done - out0, d->midi_done - midi0,
-	       d->midi_bytes, d->xfer_err);
-	if (d->first_midi_len) {
-		printf("             first MIDI bytes:");
-		for (i = 0; i < d->first_midi_len; i++)
-			printf(" %02X", d->first_midi[i]);
-		printf("\n");
-	}
-	return d->out_done > out0 || d->midi_done > midi0;
-}
-
 /*
- * Staged test: start with the steps known to be harmless and only try the
- * riskier requests (sample rate) while nothing flows yet. Every stage
- * checks that the device is still alive.
+ * Input-only test: activate interface 0 (stable on the DJ2 ME) and only
+ * listen on the MIDI input endpoint, without the streaming bit or any audio
+ * request (those crash this controller). Then, separately, check whether
+ * the output endpoint accepts data without the streaming bit.
  */
 int dj_diag(libusb_context *ctx, const struct dj_config *cfg)
 {
-	static uint8_t out_buf[PT_BULK_UNIT_SIZE * 2], midi_buf[512];
-	struct diag_ctx d = { .pause_ms = 300 };
+	static uint8_t midi_buf[2][512], out_buf[PT_BULK_UNIT_SIZE];
+	struct diag_ctx d = { .pause_ms = 300, .live = 1 };
 	libusb_device *dev;
-	uint8_t fw[8], status = 0;
-	const char *result = NULL;
-	int r;
+	uint8_t fw[8];
+	int r, i;
+	bool listen_ok = false;
 
+	midi_parser_reset(&d.parser);
 	dev = find_device(ctx, cfg);
 	if (!dev) {
 		printf("No device %04x:%04x found.\n", cfg->vid, cfg->pid);
@@ -423,7 +422,6 @@ int dj_diag(libusb_context *ctx, const struct dj_config *cfg)
 		return 1;
 	}
 	clock_gettime(CLOCK_MONOTONIC, &d.t0);
-	pt_out_init(out_buf, 2, PT_MODE_BULK);
 
 	r = libusb_claim_interface(d.h, 0);
 	if (!diag_check(ctx, &d, "claim interface 0", r) || r)
@@ -431,88 +429,51 @@ int dj_diag(libusb_context *ctx, const struct dj_config *cfg)
 	r = read_firmware(d.h, fw, sizeof(fw));
 	if (!diag_check(ctx, &d, "read firmware", r))
 		goto out;
-	r = read_status(d.h, &status);
-	if (r == 0 && (status & PT_STATUS_STREAMING))
-		printf("             NOTE: status 0x%02X already has the streaming bit set - "
-		       "the controller was not power-cycled since the last test\n", status);
 	r = libusb_set_interface_alt_setting(d.h, 0, PT_ALT_SETTING);
 	if (!diag_check(ctx, &d, "interface 0 -> alt 1", r))
-		goto out;
-	r = libusb_clear_halt(d.h, PT_EP_PCM_OUT);
-	if (!diag_check(ctx, &d, "clear halt 0x05", r))
 		goto out;
 	r = libusb_clear_halt(d.h, PT_EP_MIDI_IN);
 	if (!diag_check(ctx, &d, "clear halt 0x83", r))
 		goto out;
 
-	/* stage 1: status register only */
-	printf("--- Stage 1: streaming bit only ---\n");
-	r = read_status(d.h, &status);
-	if (r == 0 && !(status & PT_STATUS_STREAMING))
-		r = libusb_control_transfer(d.h, PT_REQ_STATUS_WRITE_TYPE, PT_REQ_STATUS,
-					    pt_status_confirm_wvalue(status), 0, NULL, 0,
-					    CTRL_TIMEOUT_MS);
-	if (!diag_check(ctx, &d, "start streaming (status | 0x20)", r))
-		goto out;
-	r = diag_stream(&d, PT_EP_PCM_OUT, out_buf, sizeof(out_buf));
+	printf("--- Test 1: listen on MIDI input only (no streaming, no audio) ---\n");
+	r = diag_stream(&d, PT_EP_MIDI_IN, midi_buf[0], sizeof(midi_buf[0]));
 	if (!r)
-		r = diag_stream(&d, PT_EP_MIDI_IN, midi_buf, sizeof(midi_buf));
-	if (!diag_check(ctx, &d, "submit output + MIDI input", r) || r)
+		r = diag_stream(&d, PT_EP_MIDI_IN, midi_buf[1], sizeof(midi_buf[1]));
+	if (!diag_check(ctx, &d, "start listening on 0x83", r) || r)
 		goto out;
-	if (diag_measure(ctx, &d, 4)) {
-		result = "stage 1 (streaming bit only)";
-		goto out;
+	printf("[%7.1f ms] listening for 20 s - PRESS BUTTONS, MOVE FADERS, TURN JOG WHEELS NOW\n",
+	       diag_ms(&d));
+	fflush(stdout);
+	for (i = 0; i < 20 && !d.xfer_err; i++) {
+		diag_wait(ctx, 1000);
+		if (i % 5 == 4 && !diag_check(ctx, &d, "still listening", 0))
+			goto out;
 	}
+	printf("[%7.1f ms]   USB packets on 0x83: %d, bytes: %d, MIDI bytes: %d, transfer error %d\n",
+	       diag_ms(&d), d.midi_done, d.raw_bytes, d.midi_bytes, d.xfer_err);
+	listen_ok = d.midi_bytes > 0;
 
-	/* stage 2: set (never read) the rate on the output endpoint */
-	printf("--- Stage 2: SET sample rate 44100 on EP 0x05 ---\n");
-	r = write_rate(d.h, PT_EP_PCM_OUT, 44100);
-	if (!diag_check(ctx, &d, "set rate on 0x05", r))
+	printf("--- Test 2: one output packet (LEDs) without streaming bit ---\n");
+	pt_out_init(out_buf, 1, PT_MODE_BULK);
+	d.xfer_err = 0;
+	r = diag_stream(&d, PT_EP_PCM_OUT, out_buf, sizeof(out_buf));
+	if (!diag_check(ctx, &d, "submit one output packet", r))
 		goto out;
-	if (diag_measure(ctx, &d, 4)) {
-		result = "stage 2 (rate on 0x05)";
-		goto out;
-	}
-
-	/* stage 3: the same on the capture endpoint */
-	printf("--- Stage 3: SET sample rate 44100 on EP 0x86 ---\n");
-	r = write_rate(d.h, PT_EP_PCM_IN, 44100);
-	if (!diag_check(ctx, &d, "set rate on 0x86", r))
-		goto out;
-	if (diag_measure(ctx, &d, 4)) {
-		result = "stage 3 (rate on 0x86)";
-		goto out;
-	}
-
-	/* stage 4: toggle the streaming bit off and on again after the rate */
-	printf("--- Stage 4: re-arm streaming bit ---\n");
-	r = read_status(d.h, &status);
-	if (r == 0)
-		r = libusb_control_transfer(d.h, PT_REQ_STATUS_WRITE_TYPE, PT_REQ_STATUS,
-					    (uint16_t)(int16_t)(int8_t)(status & ~PT_STATUS_STREAMING),
-					    0, NULL, 0, CTRL_TIMEOUT_MS);
-	if (!diag_check(ctx, &d, "streaming bit off", r))
-		goto out;
-	r = read_status(d.h, &status);
-	if (r == 0)
-		r = libusb_control_transfer(d.h, PT_REQ_STATUS_WRITE_TYPE, PT_REQ_STATUS,
-					    pt_status_confirm_wvalue(status), 0, NULL, 0,
-					    CTRL_TIMEOUT_MS);
-	if (!diag_check(ctx, &d, "streaming bit on", r))
-		goto out;
-	if (diag_measure(ctx, &d, 4))
-		result = "stage 4 (re-armed streaming bit)";
+	diag_wait(ctx, 1000);
+	printf("[%7.1f ms]   output packets accepted: %d, transfer error %d\n",
+	       diag_ms(&d), d.out_done, d.xfer_err);
+	diag_check(ctx, &d, "after output test", 0);
 
 out:
 	diag_stop_streams(ctx, &d);
-	libusb_set_interface_alt_setting(d.h, 0, 0);
-	libusb_release_interface(d.h, 0);
 	libusb_close(d.h);
-	if (result)
-		printf("\nResult: data flows after %s\n", result);
+	if (listen_ok)
+		printf("\nResult: controls WORK in input-only mode (%d MIDI bytes received)\n",
+		       d.midi_bytes);
 	else
-		printf("\nResult: no data flowed\n");
-	return result ? 0 : 1;
+		printf("\nResult: no MIDI data received\n");
+	return listen_ok ? 0 : 1;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -715,7 +676,7 @@ static int start_streaming(struct dj_device *dev)
 	int out_len = (int)(pt_out_unit_size(dev->mode) * UNITS_PER_OUT_XFER);
 	int i, r = 0;
 
-	for (i = 0; i < NUM_OUT_XFERS && !r; i++)
+	for (i = 0; i < NUM_OUT_XFERS && !r && dev->cfg.leds; i++)
 		r = add_xfer(dev, XFER_OUT, &dev->ep_out, out_len);
 	if (dev->ep_midi_in.addr)
 		for (i = 0; i < NUM_MIDI_IN_XFERS && !r; i++)
@@ -819,6 +780,14 @@ static int handshake(struct dj_device *dev)
 	if (dev->ep_midi_in.addr && step_failed(dev, libusb_clear_halt(h, dev->ep_midi_in.addr), false))
 		return LIBUSB_ERROR_NO_DEVICE;
 	sleep_ms(6);
+
+	/*
+	 * Input-only mode (default): the DJ2 ME crashes as soon as its audio
+	 * engine is started (streaming bit, rate requests, interface 1), but
+	 * interface 0 alone is stable. Stop here and only read EP 0x83.
+	 */
+	if (!dev->cfg.leds)
+		return 0;
 
 	step(dev, "read status");
 	r = read_status(h, &status);
@@ -948,7 +917,8 @@ struct dj_device *dj_open(libusb_context *ctx, const struct dj_config *cfg,
 	if (r)
 		goto fail;
 
-	LOG(dev, "Controller ready (%s mode)\n", dev->mode == PT_MODE_BULK ? "bulk" : "interrupt");
+	LOG(dev, "Controller ready (%s)\n", dev->cfg.leds ?
+	    "controls + LEDs" : "controls only, LEDs off");
 	return dev;
 
 fail:

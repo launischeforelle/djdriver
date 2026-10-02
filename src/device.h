@@ -23,6 +23,7 @@ struct dj_config {
 	int ep_midi_in;
 	int ep_pcm_in;
 	int capture;		/* also activate interface 1 (audio input) */
+	int leds;		/* start the output stream (LEDs); crashes the DJ2 ME */
 	int verbose;
 };
 

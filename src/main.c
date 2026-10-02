@@ -175,7 +175,7 @@ static void usage(const char *prog)
 		"  run        run the driver (default)\n"
 		"  monitor    run the driver and print all MIDI messages\n"
 		"  probe      print USB descriptors and device status, then exit\n"
-		"  diag       run the start-up steps one by one and report which one fails\n"
+		"  diag       listen for controls step by step and report what arrives\n"
 		"  ledtest    light note 0..127 on channel 1 one by one, then exit\n"
 		"\n"
 		"Options:\n"
@@ -187,6 +187,7 @@ static void usage(const char *prog)
 		"      --ep-out HEX    override output endpoint (default 0x05)\n"
 		"      --ep-midi HEX   override MIDI input endpoint (default 0x83)\n"
 		"      --ep-pcm HEX    override audio input endpoint (default 0x86)\n"
+		"      --leds          start the output stream for the LEDs (experimental)\n"
 		"      --capture       also activate the audio input interface\n"
 		"  -h, --help          this help\n",
 		DJDRIVER_VERSION, prog, DEFAULT_PORT_NAME,
@@ -219,6 +220,7 @@ int main(int argc, char **argv)
 		{ "ep-midi", required_argument, NULL, 4 },
 		{ "ep-pcm",  required_argument, NULL, 5 },
 		{ "capture", no_argument,       NULL, 6 },
+		{ "leds",    no_argument,       NULL, 7 },
 		{ "help",    no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
@@ -245,6 +247,7 @@ int main(int argc, char **argv)
 		case 4:   app->cfg.ep_midi_in = (int)parse_num(optarg, 16); break;
 		case 5:   app->cfg.ep_pcm_in = (int)parse_num(optarg, 16); break;
 		case 6:   app->cfg.capture = 1; break;
+		case 7:   app->cfg.leds = 1; break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 2;
 		}
@@ -271,6 +274,8 @@ int main(int argc, char **argv)
 	}
 
 	app->monitor = !strcmp(cmd, "monitor");
+	if (!strcmp(cmd, "ledtest"))
+		app->cfg.leds = 1;
 	midi_out_queue_init(&app->out_queue);
 	midi_parser_reset(&app->out_parser);
 	pthread_mutex_init(&app->cache_lock, NULL);
