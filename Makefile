@@ -1,7 +1,7 @@
 PREFIX   ?= /usr/local
 CC       ?= cc
 CFLAGS   ?= -O2
-CFLAGS   += -std=gnu11 -Wall -Wextra -Wno-unused-parameter
+override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter
 LIBUSB_CFLAGS := $(shell pkg-config --cflags libusb-1.0)
 LIBUSB_LIBS   := $(shell pkg-config --libs libusb-1.0)
 

@@ -61,6 +61,9 @@ struct dj_device {
 	int active;		/* transfers currently submitted */
 	int stopping;
 	int failed;
+	struct timespec t0;	/* start of the handshake */
+	const char *step;	/* current handshake step, for error messages */
+	int seen_data[3];	/* per xfer_kind: first completion logged */
 	int consec_errors;
 };
 
@@ -69,6 +72,16 @@ static void sleep_ms(unsigned int ms)
 	struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
 
 	nanosleep(&ts, NULL);
+}
+
+/* Milliseconds since the handshake started, for the verbose log */
+static double elapsed_ms(const struct dj_device *dev)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)(ts.tv_sec - dev->t0.tv_sec) * 1000.0 +
+	       (double)(ts.tv_nsec - dev->t0.tv_nsec) / 1e6;
 }
 
 void dj_config_defaults(struct dj_config *cfg)
@@ -248,7 +261,8 @@ int dj_probe(libusb_context *ctx, const struct dj_config *cfg)
 		printf("  Status:    0x%02X\n", status);
 	r = read_rate(h, 0, &rate);
 	if (r)
-		printf("  Rate:      read failed (%s)\n", libusb_error_name(r));
+		printf("  Rate:      read failed (%s) - normal while the driver is not running\n",
+		       libusb_error_name(r));
 	else
 		printf("  Rate:      %u Hz\n", rate);
 	libusb_close(h);
@@ -370,6 +384,13 @@ static void LIBUSB_CALL xfer_cb(struct libusb_transfer *t)
 	switch (t->status) {
 	case LIBUSB_TRANSFER_COMPLETED:
 		dev->consec_errors = 0;
+		if (!dev->seen_data[x->kind]) {
+			static const char *const names[] = { "output", "MIDI input", "audio input" };
+
+			dev->seen_data[x->kind] = 1;
+			DBG(dev, "[%7.1f ms] first %s transfer done (%d bytes)\n",
+			    elapsed_ms(dev), names[x->kind], t->actual_length);
+		}
 		if (x->kind == XFER_OUT)
 			fill_midi(dev, x->buf);
 		else if (x->kind == XFER_MIDI_IN)
@@ -381,7 +402,8 @@ static void LIBUSB_CALL xfer_cb(struct libusb_transfer *t)
 		return;
 	case LIBUSB_TRANSFER_NO_DEVICE:
 		if (!dev->failed)
-			LOG(dev, "Device disconnected\n");
+			LOG(dev, "Device disconnected (%.0f ms after start-up began)\n",
+			    elapsed_ms(dev));
 		dev->failed = 1;
 		dev->active--;
 		return;
@@ -472,70 +494,124 @@ static int start_streaming(struct dj_device *dev)
 /* Open / close                                                            */
 /* ---------------------------------------------------------------------- */
 
+static void step(struct dj_device *dev, const char *name)
+{
+	dev->step = name;
+	DBG(dev, "[%7.1f ms] %s\n", elapsed_ms(dev), name);
+}
+
+/* Report a failed step; returns true if the handshake has to be aborted */
+static bool step_failed(struct dj_device *dev, int r, bool fatal)
+{
+	if (r >= 0)
+		return false;
+	if (r == LIBUSB_ERROR_NO_DEVICE) {
+		LOG(dev, "Error: the controller dropped off the USB bus during step \"%s\" "
+		    "(%.0f ms into the start-up sequence)\n", dev->step, elapsed_ms(dev));
+		LOG(dev, "  Hint: if the controller's own power supply is not connected, try it "
+		    "(or a powered USB hub): the audio part draws more current once it is "
+		    "switched on.\n");
+		return true;
+	}
+	LOG(dev, "%s: step \"%s\" failed: %s\n", fatal ? "Error" : "Warning",
+	    dev->step, libusb_error_name(r));
+	return fatal;
+}
+
+/*
+ * Start-up sequence, modelled step by step (including the pauses) on USB
+ * captures of the vendor's macOS driver made by the alsa-jockey3 project.
+ * The firmware is sensitive to requests arriving faster than that.
+ */
 static int handshake(struct dj_device *dev)
 {
 	libusb_device_handle *h = dev->h;
-	uint16_t idx_in = dev->ep_pcm_in.addr ? dev->ep_pcm_in.addr : PT_EP_PCM_IN;
-	uint16_t idx_out = dev->ep_out.addr;
-	const uint16_t burst[] = { idx_in, idx_out, idx_in, idx_out, idx_in };
-	uint8_t fw[15], status;
+	uint16_t idx_in, idx_out;
+	uint16_t burst[5];
+	uint8_t fw[8], status;
 	uint32_t rate = 0;
 	unsigned int i;
 	int r;
 
-	/* 1. firmware version: the first request the vendor drivers send */
-	r = read_firmware(h, fw, sizeof(fw));
-	if (r < 0)
-		LOG(dev, "Warning: reading firmware version failed: %s\n", libusb_error_name(r));
-	else if (r >= 3)
-		LOG(dev, "Firmware: %02X %02X %02X\n", fw[0], fw[1], fw[2]);
+	clock_gettime(CLOCK_MONOTONIC, &dev->t0);
 
-	/* 2. activate the streaming interfaces */
+	step(dev, "read firmware version");
+	r = read_firmware(h, fw, sizeof(fw));
+	if (step_failed(dev, r, false))
+		return r;
+	if (r >= 3)
+		LOG(dev, "Firmware: %02X %02X %02X\n", fw[0], fw[1], fw[2]);
+	sleep_ms(20);
+
+	/* activate the streaming interfaces, ~16 ms apart like the vendor driver */
 	for (i = 0; i < PT_NUM_INTERFACES; i++) {
 		if (!dev->claimed[i])
 			continue;
+		step(dev, i == 0 ? "interface 0 -> alt 1" : "interface 1 -> alt 1");
 		r = libusb_set_interface_alt_setting(h, (int)i, PT_ALT_SETTING);
-		if (r)
-			LOG(dev, "Warning: interface %u alt %d: %s\n", i, PT_ALT_SETTING,
-			    libusb_error_name(r));
+		if (r < 0 && step_failed(dev, r, true))
+			return r;
+		sleep_ms(16);
 	}
 
 	r = discover_endpoints(dev);
 	if (r)
 		return r;
-	libusb_clear_halt(h, dev->ep_out.addr);
-	if (dev->ep_midi_in.addr)
-		libusb_clear_halt(h, dev->ep_midi_in.addr);
-	if (dev->ep_pcm_in.addr)
-		libusb_clear_halt(h, dev->ep_pcm_in.addr);
+	idx_in = dev->ep_pcm_in.addr ? dev->ep_pcm_in.addr : PT_EP_PCM_IN;
+	idx_out = dev->ep_out.addr;
 
-	/* 3. sample rate: the vendor drivers program it in a burst */
-	if (read_rate(h, 0, &rate) == 0)
-		DBG(dev, "Current rate: %u Hz\n", rate);
+	step(dev, "clear endpoint halt");
+	if (dev->ep_pcm_in.addr && step_failed(dev, libusb_clear_halt(h, dev->ep_pcm_in.addr), false))
+		return LIBUSB_ERROR_NO_DEVICE;
+	if (step_failed(dev, libusb_clear_halt(h, dev->ep_out.addr), false))
+		return LIBUSB_ERROR_NO_DEVICE;
+	if (dev->ep_midi_in.addr && step_failed(dev, libusb_clear_halt(h, dev->ep_midi_in.addr), false))
+		return LIBUSB_ERROR_NO_DEVICE;
+	sleep_ms(6);
+
+	step(dev, "read status");
+	r = read_status(h, &status);
+	if (step_failed(dev, r, true))
+		return r;
+	DBG(dev, "           status 0x%02X\n", status);
+
+	step(dev, "read sample rate");
+	r = read_rate(h, 0, &rate);
+	if (step_failed(dev, r, false) && r == LIBUSB_ERROR_NO_DEVICE)
+		return r;
+	if (r == 0)
+		DBG(dev, "           rate %u Hz\n", rate);
 	sleep_ms(14);
+
+	/* the vendor drivers always write 86 05 86 05 86, ending on the capture EP */
+	step(dev, "set sample rate");
+	burst[0] = burst[2] = burst[4] = idx_in;
+	burst[1] = burst[3] = idx_out;
 	for (i = 0; i < sizeof(burst) / sizeof(burst[0]); i++) {
 		r = write_rate(h, burst[i], dev->cfg.rate);
-		if (r)
-			LOG(dev, "Warning: setting rate on EP 0x%02x failed: %s\n",
-			    burst[i], libusb_error_name(r));
+		if (step_failed(dev, r, false) && r == LIBUSB_ERROR_NO_DEVICE)
+			return r;
 	}
-	if (read_rate(h, idx_in, &rate) == 0 && rate != dev->cfg.rate)
+
+	step(dev, "verify sample rate");
+	r = read_rate(h, idx_in, &rate);
+	if (step_failed(dev, r, false) && r == LIBUSB_ERROR_NO_DEVICE)
+		return r;
+	if (r == 0 && rate != dev->cfg.rate)
 		LOG(dev, "Warning: requested %u Hz, device reports %u Hz\n", dev->cfg.rate, rate);
 	sleep_ms(50);
 
-	/* 4. start streaming: write back the status register with bit 5 set */
+	step(dev, "read status");
 	r = read_status(h, &status);
-	if (r) {
-		LOG(dev, "Error: reading status failed: %s\n", libusb_error_name(r));
+	if (step_failed(dev, r, true))
 		return r;
-	}
-	DBG(dev, "Status: 0x%02X\n", status);
+
+	/* write back the status register with bit 5 set: starts streaming */
+	step(dev, "start streaming");
 	r = libusb_control_transfer(h, PT_REQ_STATUS_WRITE_TYPE, PT_REQ_STATUS,
 				    pt_status_confirm_wvalue(status), 0, NULL, 0, CTRL_TIMEOUT_MS);
-	if (r < 0) {
-		LOG(dev, "Error: start streaming failed: %s\n", libusb_error_name(r));
+	if (step_failed(dev, r, true))
 		return r;
-	}
 	return 0;
 }
 
@@ -596,6 +672,7 @@ struct dj_device *dj_open(libusb_context *ctx, const struct dj_config *cfg,
 	r = handshake(dev);
 	if (r)
 		goto fail;
+	step(dev, "submit stream transfers");
 	r = start_streaming(dev);
 	if (r)
 		goto fail;
