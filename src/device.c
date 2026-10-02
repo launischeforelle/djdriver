@@ -276,6 +276,8 @@ struct diag_ctx {
 	int nxfers;
 	int out_done, midi_done, pcm_done, xfer_err;
 	int midi_bytes;
+	uint8_t first_midi[16];
+	int first_midi_len;
 };
 
 static double diag_ms(const struct diag_ctx *d)
@@ -332,8 +334,12 @@ static void LIBUSB_CALL diag_cb(struct libusb_transfer *t)
 	if (t->endpoint == PT_EP_PCM_OUT) {
 		d->out_done++;
 	} else if (t->endpoint == PT_EP_MIDI_IN) {
+		size_t n = pt_midi_in_strip(t->buffer, (size_t)t->actual_length), k;
+
 		d->midi_done++;
-		d->midi_bytes += (int)pt_midi_in_strip(t->buffer, (size_t)t->actual_length);
+		d->midi_bytes += (int)n;
+		for (k = 0; k < n && d->first_midi_len < (int)sizeof(d->first_midi); k++)
+			d->first_midi[d->first_midi_len++] = t->buffer[k];
 	} else {
 		d->pcm_done++;
 	}
@@ -369,31 +375,52 @@ static void diag_stop_streams(libusb_context *ctx, struct diag_ctx *d)
 	d->nxfers = 0;
 }
 
-enum diag_variant {
-	DIAG_STATUS,		/* interface 0, start streaming via status write */
-	DIAG_NO_STATUS,		/* interface 0, streams without the status write */
-};
+/* Stream for @secs seconds and report what moved; true if data flowed */
+static bool diag_measure(libusb_context *ctx, struct diag_ctx *d, int secs)
+{
+	int out0 = d->out_done, midi0 = d->midi_done, i;
 
-static bool diag_run(libusb_context *ctx, const struct dj_config *cfg, enum diag_variant v)
+	printf("[%7.1f ms] streaming for %d s - PRESS BUTTONS / MOVE FADERS NOW\n",
+	       diag_ms(d), secs);
+	fflush(stdout);
+	for (i = 0; i < secs * 10 && !d->xfer_err; i++)
+		diag_wait(ctx, 100);
+	printf("[%7.1f ms]   output transfers %d, MIDI transfers %d, MIDI bytes so far %d, "
+	       "transfer error %d\n", diag_ms(d), d->out_done - out0, d->midi_done - midi0,
+	       d->midi_bytes, d->xfer_err);
+	if (d->first_midi_len) {
+		printf("             first MIDI bytes:");
+		for (i = 0; i < d->first_midi_len; i++)
+			printf(" %02X", d->first_midi[i]);
+		printf("\n");
+	}
+	return d->out_done > out0 || d->midi_done > midi0;
+}
+
+/*
+ * Staged test: start with the steps known to be harmless and only try the
+ * riskier requests (sample rate) while nothing flows yet. Every stage
+ * checks that the device is still alive.
+ */
+int dj_diag(libusb_context *ctx, const struct dj_config *cfg)
 {
 	static uint8_t out_buf[PT_BULK_UNIT_SIZE * 2], midi_buf[512];
 	struct diag_ctx d = { .pause_ms = 300 };
 	libusb_device *dev;
 	uint8_t fw[8], status = 0;
-	unsigned int i;
+	const char *result = NULL;
 	int r;
-	bool ok = false;
 
 	dev = find_device(ctx, cfg);
 	if (!dev) {
 		printf("No device %04x:%04x found.\n", cfg->vid, cfg->pid);
-		return false;
+		return 1;
 	}
 	r = libusb_open(dev, &d.h);
 	libusb_unref_device(dev);
 	if (r) {
 		printf("Cannot open device: %s\n", libusb_error_name(r));
-		return false;
+		return 1;
 	}
 	clock_gettime(CLOCK_MONOTONIC, &d.t0);
 	pt_out_init(out_buf, 2, PT_MODE_BULK);
@@ -404,6 +431,10 @@ static bool diag_run(libusb_context *ctx, const struct dj_config *cfg, enum diag
 	r = read_firmware(d.h, fw, sizeof(fw));
 	if (!diag_check(ctx, &d, "read firmware", r))
 		goto out;
+	r = read_status(d.h, &status);
+	if (r == 0 && (status & PT_STATUS_STREAMING))
+		printf("             NOTE: status 0x%02X already has the streaming bit set - "
+		       "the controller was not power-cycled since the last test\n", status);
 	r = libusb_set_interface_alt_setting(d.h, 0, PT_ALT_SETTING);
 	if (!diag_check(ctx, &d, "interface 0 -> alt 1", r))
 		goto out;
@@ -413,69 +444,75 @@ static bool diag_run(libusb_context *ctx, const struct dj_config *cfg, enum diag
 	r = libusb_clear_halt(d.h, PT_EP_MIDI_IN);
 	if (!diag_check(ctx, &d, "clear halt 0x83", r))
 		goto out;
-	if (v == DIAG_STATUS) {
-		read_status(d.h, &status);
+
+	/* stage 1: status register only */
+	printf("--- Stage 1: streaming bit only ---\n");
+	r = read_status(d.h, &status);
+	if (r == 0 && !(status & PT_STATUS_STREAMING))
 		r = libusb_control_transfer(d.h, PT_REQ_STATUS_WRITE_TYPE, PT_REQ_STATUS,
 					    pt_status_confirm_wvalue(status), 0, NULL, 0,
 					    CTRL_TIMEOUT_MS);
-		if (!diag_check(ctx, &d, "start streaming (status | 0x20)", r))
-			goto out;
-	}
+	if (!diag_check(ctx, &d, "start streaming (status | 0x20)", r))
+		goto out;
 	r = diag_stream(&d, PT_EP_PCM_OUT, out_buf, sizeof(out_buf));
 	if (!r)
 		r = diag_stream(&d, PT_EP_MIDI_IN, midi_buf, sizeof(midi_buf));
-	if (!diag_check(ctx, &d, "start output + MIDI input streams", r))
+	if (!diag_check(ctx, &d, "submit output + MIDI input", r) || r)
 		goto out;
+	if (diag_measure(ctx, &d, 4)) {
+		result = "stage 1 (streaming bit only)";
+		goto out;
+	}
 
-	printf("[%7.1f ms] streaming for 5 s - PRESS SOME BUTTONS NOW\n", diag_ms(&d));
-	fflush(stdout);
-	for (i = 0; i < 50 && !d.xfer_err; i++)
-		diag_wait(ctx, 100);
-	printf("[%7.1f ms] output transfers %d, MIDI transfers %d (%d MIDI bytes), "
-	       "transfer error %d\n", diag_ms(&d), d.out_done, d.midi_done, d.midi_bytes,
-	       d.xfer_err);
-	ok = !d.xfer_err && diag_check(ctx, &d, "after streaming", 0);
+	/* stage 2: set (never read) the rate on the output endpoint */
+	printf("--- Stage 2: SET sample rate 44100 on EP 0x05 ---\n");
+	r = write_rate(d.h, PT_EP_PCM_OUT, 44100);
+	if (!diag_check(ctx, &d, "set rate on 0x05", r))
+		goto out;
+	if (diag_measure(ctx, &d, 4)) {
+		result = "stage 2 (rate on 0x05)";
+		goto out;
+	}
+
+	/* stage 3: the same on the capture endpoint */
+	printf("--- Stage 3: SET sample rate 44100 on EP 0x86 ---\n");
+	r = write_rate(d.h, PT_EP_PCM_IN, 44100);
+	if (!diag_check(ctx, &d, "set rate on 0x86", r))
+		goto out;
+	if (diag_measure(ctx, &d, 4)) {
+		result = "stage 3 (rate on 0x86)";
+		goto out;
+	}
+
+	/* stage 4: toggle the streaming bit off and on again after the rate */
+	printf("--- Stage 4: re-arm streaming bit ---\n");
+	r = read_status(d.h, &status);
+	if (r == 0)
+		r = libusb_control_transfer(d.h, PT_REQ_STATUS_WRITE_TYPE, PT_REQ_STATUS,
+					    (uint16_t)(int16_t)(int8_t)(status & ~PT_STATUS_STREAMING),
+					    0, NULL, 0, CTRL_TIMEOUT_MS);
+	if (!diag_check(ctx, &d, "streaming bit off", r))
+		goto out;
+	r = read_status(d.h, &status);
+	if (r == 0)
+		r = libusb_control_transfer(d.h, PT_REQ_STATUS_WRITE_TYPE, PT_REQ_STATUS,
+					    pt_status_confirm_wvalue(status), 0, NULL, 0,
+					    CTRL_TIMEOUT_MS);
+	if (!diag_check(ctx, &d, "streaming bit on", r))
+		goto out;
+	if (diag_measure(ctx, &d, 4))
+		result = "stage 4 (re-armed streaming bit)";
 
 out:
 	diag_stop_streams(ctx, &d);
+	libusb_set_interface_alt_setting(d.h, 0, 0);
+	libusb_release_interface(d.h, 0);
 	libusb_close(d.h);
-	return ok;
-}
-
-/* Wait (up to @secs) for the device to re-appear after a crash */
-static bool diag_wait_for_device(libusb_context *ctx, const struct dj_config *cfg, int secs)
-{
-	int i;
-
-	sleep_ms(1500);	/* let a crashed device drop off the bus first */
-	for (i = 0; i < secs * 2; i++) {
-		if (dj_present(ctx, cfg)) {
-			sleep_ms(1500);	/* give macOS time to finish enumerating it */
-			return true;
-		}
-		sleep_ms(500);
-	}
-	return false;
-}
-
-int dj_diag(libusb_context *ctx, const struct dj_config *cfg)
-{
-	bool a, b;
-
-	printf("=== Test A: interface 0, streaming started via status register ===\n");
-	a = diag_run(ctx, cfg, DIAG_STATUS);
-	printf("Test A: %s\n\n", a ? "OK" : "FAILED");
-	if (a)
-		return 0;
-
-	printf("=== Test B: interface 0, streams without status register write ===\n");
-	if (!diag_wait_for_device(ctx, cfg, 20)) {
-		printf("Device did not come back, skipping test B.\n");
-		return 1;
-	}
-	b = diag_run(ctx, cfg, DIAG_NO_STATUS);
-	printf("Test B: %s\n", b ? "OK" : "FAILED");
-	return b ? 0 : 1;
+	if (result)
+		printf("\nResult: data flows after %s\n", result);
+	else
+		printf("\nResult: no data flowed\n");
+	return result ? 0 : 1;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -635,6 +672,8 @@ static void LIBUSB_CALL xfer_cb(struct libusb_transfer *t)
 		return;
 	}
 	r = libusb_submit_transfer(t);
+	if (r == LIBUSB_ERROR_PIPE && libusb_clear_halt(dev->h, t->endpoint) == 0)
+		r = libusb_submit_transfer(t);
 	if (r) {
 		LOG(dev, "Resubmitting transfer on EP 0x%02x failed: %s\n",
 		    t->endpoint, libusb_error_name(r));
@@ -832,6 +871,10 @@ static int handshake(struct dj_device *dev)
 
 	/* write back the status register with bit 5 set: starts streaming */
 	step(dev, "start streaming");
+	if (status & PT_STATUS_STREAMING) {
+		DBG(dev, "           streaming bit already set\n");
+		return 0;
+	}
 	r = libusb_control_transfer(h, PT_REQ_STATUS_WRITE_TYPE, PT_REQ_STATUS,
 				    pt_status_confirm_wvalue(status), 0, NULL, 0, CTRL_TIMEOUT_MS);
 	if (step_failed(dev, r, true))
