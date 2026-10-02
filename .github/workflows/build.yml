@@ -1,0 +1,25 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos:
+    # Apple Silicon (M1) runner
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install libusb pkg-config || true
+      - run: make CFLAGS="-O2 -Werror"
+      - run: make test
+      - run: file djdriver && ./djdriver --help
+      - run: ./djdriver probe || true
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev
+      - run: make CFLAGS="-O2 -Werror"
+      - run: make clean && make CFLAGS="-O1 -g -fsanitize=address,undefined" test

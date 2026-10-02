@@ -1,0 +1,4 @@
+*.o
+/djdriver
+/tests/test_protocol
+.DS_Store
