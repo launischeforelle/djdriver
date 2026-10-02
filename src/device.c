@@ -270,6 +270,184 @@ int dj_probe(libusb_context *ctx, const struct dj_config *cfg)
 }
 
 /* ---------------------------------------------------------------------- */
+/* Step-by-step diagnosis                                                  */
+/* ---------------------------------------------------------------------- */
+
+struct diag_ctx {
+	libusb_device_handle *h;
+	struct timespec t0;
+	unsigned int pause_ms;
+	int out_done, midi_done, pcm_done, xfer_err;
+	int midi_bytes;
+};
+
+static double diag_ms(const struct diag_ctx *d)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)(ts.tv_sec - d->t0.tv_sec) * 1000.0 +
+	       (double)(ts.tv_nsec - d->t0.tv_nsec) / 1e6;
+}
+
+/*
+ * Report the result of a step, wait, then check that the device still
+ * answers a status request. Returns false if the device is gone.
+ */
+static bool diag_check(struct diag_ctx *d, const char *what, int r)
+{
+	uint8_t status;
+	int s;
+
+	printf("[%7.1f ms] %-34s -> %s\n", diag_ms(d), what,
+	       r >= 0 ? "ok" : libusb_error_name(r));
+	fflush(stdout);
+	sleep_ms(d->pause_ms);
+	s = read_status(d->h, &status);
+	if (s) {
+		printf("[%7.1f ms]   device no longer answers (%s): the step above "
+		       "made it crash or disconnect\n", diag_ms(d), libusb_error_name(s));
+		return false;
+	}
+	printf("[%7.1f ms]   still alive, status 0x%02X\n", diag_ms(d), status);
+	return true;
+}
+
+static void LIBUSB_CALL diag_cb(struct libusb_transfer *t)
+{
+	struct diag_ctx *d = t->user_data;
+
+	if (t->status != LIBUSB_TRANSFER_COMPLETED) {
+		d->xfer_err = t->status;
+		return;
+	}
+	if (t->endpoint == PT_EP_PCM_OUT) {
+		d->out_done++;
+	} else if (t->endpoint == PT_EP_MIDI_IN) {
+		d->midi_done++;
+		d->midi_bytes += (int)pt_midi_in_strip(t->buffer, (size_t)t->actual_length);
+	} else {
+		d->pcm_done++;
+	}
+	if (libusb_submit_transfer(t))
+		d->xfer_err = -1;
+}
+
+int dj_diag(libusb_context *ctx, const struct dj_config *cfg, unsigned int pause_ms)
+{
+	static uint8_t out_buf[PT_BULK_UNIT_SIZE * 2], midi_buf[512], pcm_buf[PT_IN_TRANSFER_SIZE];
+	struct libusb_transfer *t_out = NULL, *t_midi = NULL, *t_pcm = NULL;
+	struct diag_ctx d = { .pause_ms = pause_ms };
+	const uint16_t burst[] = { PT_EP_PCM_IN, PT_EP_PCM_OUT, PT_EP_PCM_IN, PT_EP_PCM_OUT, PT_EP_PCM_IN };
+	struct timeval tv = { 0, 50000 };
+	libusb_device *dev;
+	uint8_t fw[8], status = 0;
+	uint32_t rate;
+	unsigned int i;
+	int r, n, conf = -1;
+	bool ok = false;
+
+	dev = find_device(ctx, cfg);
+	if (!dev) {
+		printf("No device %04x:%04x found.\n", cfg->vid, cfg->pid);
+		return 1;
+	}
+	r = libusb_open(dev, &d.h);
+	libusb_unref_device(dev);
+	if (r) {
+		printf("Cannot open device: %s\n", libusb_error_name(r));
+		return 1;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &d.t0);
+	printf("Step-by-step test, %u ms pause after every step.\n", pause_ms);
+
+	r = libusb_get_configuration(d.h, &conf);
+	printf("[%7.1f ms] active configuration: %d (%s)\n", diag_ms(&d), conf,
+	       r ? libusb_error_name(r) : "ok");
+	if (!diag_check(&d, "status read (baseline)", 0))
+		goto out;
+	r = libusb_claim_interface(d.h, 0);
+	if (!diag_check(&d, "claim interface 0", r) || r)
+		goto out;
+	r = libusb_claim_interface(d.h, 1);
+	if (!diag_check(&d, "claim interface 1", r) || r)
+		goto out;
+	r = read_firmware(d.h, fw, sizeof(fw));
+	if (!diag_check(&d, "read firmware", r))
+		goto out;
+	r = libusb_set_interface_alt_setting(d.h, 0, PT_ALT_SETTING);
+	if (!diag_check(&d, "interface 0 -> alt 1", r))
+		goto out;
+	r = libusb_set_interface_alt_setting(d.h, 1, PT_ALT_SETTING);
+	if (!diag_check(&d, "interface 1 -> alt 1", r))
+		goto out;
+	r = libusb_clear_halt(d.h, PT_EP_PCM_IN);
+	if (!diag_check(&d, "clear halt 0x86", r))
+		goto out;
+	r = libusb_clear_halt(d.h, PT_EP_PCM_OUT);
+	if (!diag_check(&d, "clear halt 0x05", r))
+		goto out;
+	r = libusb_clear_halt(d.h, PT_EP_MIDI_IN);
+	if (!diag_check(&d, "clear halt 0x83", r))
+		goto out;
+	r = read_rate(d.h, 0, &rate);
+	if (!diag_check(&d, "read rate (wIndex 0)", r))
+		goto out;
+	if (r == 0)
+		printf("             rate %u Hz\n", rate);
+	for (i = 0; i < 5; i++)
+		if ((r = write_rate(d.h, burst[i], cfg->rate)) < 0)
+			break;
+	if (!diag_check(&d, "set rate burst 86 05 86 05 86", r))
+		goto out;
+	r = read_rate(d.h, PT_EP_PCM_IN, &rate);
+	if (!diag_check(&d, "read rate (EP 0x86)", r))
+		goto out;
+	if (r == 0)
+		printf("             rate %u Hz\n", rate);
+	read_status(d.h, &status);
+	r = libusb_control_transfer(d.h, PT_REQ_STATUS_WRITE_TYPE, PT_REQ_STATUS,
+				    pt_status_confirm_wvalue(status), 0, NULL, 0, CTRL_TIMEOUT_MS);
+	if (!diag_check(&d, "start streaming (status | 0x20)", r))
+		goto out;
+
+	/* stream for 5 seconds */
+	pt_out_init(out_buf, 2, PT_MODE_BULK);
+	t_out = libusb_alloc_transfer(0);
+	t_midi = libusb_alloc_transfer(0);
+	t_pcm = libusb_alloc_transfer(0);
+	libusb_fill_bulk_transfer(t_out, d.h, PT_EP_PCM_OUT, out_buf, sizeof(out_buf), diag_cb, &d, 0);
+	libusb_fill_bulk_transfer(t_midi, d.h, PT_EP_MIDI_IN, midi_buf, sizeof(midi_buf), diag_cb, &d, 0);
+	libusb_fill_bulk_transfer(t_pcm, d.h, PT_EP_PCM_IN, pcm_buf, sizeof(pcm_buf), diag_cb, &d, 0);
+	r = libusb_submit_transfer(t_out);
+	if (!r)
+		r = libusb_submit_transfer(t_midi);
+	if (!r)
+		r = libusb_submit_transfer(t_pcm);
+	printf("[%7.1f ms] streaming for 5 s - press some buttons now (%s)\n", diag_ms(&d),
+	       r ? libusb_error_name(r) : "ok");
+	for (n = 0; n < 100 && !d.xfer_err && !r; n++)
+		libusb_handle_events_timeout_completed(ctx, &tv, NULL);
+	printf("[%7.1f ms] output transfers %d, MIDI transfers %d (%d MIDI bytes), "
+	       "audio input transfers %d, error %d\n", diag_ms(&d), d.out_done,
+	       d.midi_done, d.midi_bytes, d.pcm_done, d.xfer_err);
+	ok = d.out_done > 0 && !d.xfer_err;
+	libusb_cancel_transfer(t_out);
+	libusb_cancel_transfer(t_midi);
+	libusb_cancel_transfer(t_pcm);
+	for (n = 0; n < 10; n++)
+		libusb_handle_events_timeout_completed(ctx, &tv, NULL);
+	libusb_free_transfer(t_out);
+	libusb_free_transfer(t_midi);
+	libusb_free_transfer(t_pcm);
+
+out:
+	printf("Result: %s\n", ok ? "streaming works" : "failed (see above)");
+	libusb_close(d.h);
+	return ok ? 0 : 1;
+}
+
+/* ---------------------------------------------------------------------- */
 /* Endpoint discovery                                                      */
 /* ---------------------------------------------------------------------- */
 
@@ -647,8 +825,10 @@ struct dj_device *dj_open(libusb_context *ctx, const struct dj_config *cfg,
 		return NULL;
 	}
 
-	/* Linux only; harmless "not supported" elsewhere */
+#ifdef __linux__
+	/* on macOS this would try to re-enumerate ("capture") the device */
 	libusb_set_auto_detach_kernel_driver(dev->h, 1);
+#endif
 
 	if (libusb_get_configuration(dev->h, &conf) == 0 && conf == 0) {
 		r = libusb_set_configuration(dev->h, 1);

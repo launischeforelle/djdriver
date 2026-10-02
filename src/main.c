@@ -175,6 +175,7 @@ static void usage(const char *prog)
 		"  run        run the driver (default)\n"
 		"  monitor    run the driver and print all MIDI messages\n"
 		"  probe      print USB descriptors and device status, then exit\n"
+		"  diag       run the start-up steps one by one and report which one fails\n"
 		"  ledtest    light note 0..127 on channel 1 one by one, then exit\n"
 		"\n"
 		"Options:\n"
@@ -248,7 +249,8 @@ int main(int argc, char **argv)
 	if (optind < argc)
 		cmd = argv[optind++];
 	if (optind < argc || (strcmp(cmd, "run") && strcmp(cmd, "monitor") &&
-			      strcmp(cmd, "probe") && strcmp(cmd, "ledtest"))) {
+			      strcmp(cmd, "probe") && strcmp(cmd, "ledtest") &&
+			      strcmp(cmd, "diag"))) {
 		usage(argv[0]);
 		return 2;
 	}
@@ -259,8 +261,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (!strcmp(cmd, "probe")) {
-		ret = dj_probe(ctx, &app->cfg);
+	if (!strcmp(cmd, "probe") || !strcmp(cmd, "diag")) {
+		ret = !strcmp(cmd, "probe") ? dj_probe(ctx, &app->cfg) : dj_diag(ctx, &app->cfg, 500);
 		libusb_exit(ctx);
 		return ret;
 	}

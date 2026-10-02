@@ -39,6 +39,12 @@ bool dj_present(libusb_context *ctx, const struct dj_config *cfg);
 int dj_probe(libusb_context *ctx, const struct dj_config *cfg);
 
 /*
+ * Run the start-up sequence one step at a time with a pause after each step
+ * and check after every step whether the device still answers.
+ */
+int dj_diag(libusb_context *ctx, const struct dj_config *cfg, unsigned int pause_ms);
+
+/*
  * Open the device, run the Ploytec start-up handshake and start streaming.
  * MIDI for the controller is taken from @out_queue.
  */
