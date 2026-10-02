@@ -371,8 +371,8 @@ static void LIBUSB_CALL diag_cb(struct libusb_transfer *t)
 			d->last_err_in = t->status;
 		else
 			d->last_err_out = t->status;
-		if (t->status == LIBUSB_TRANSFER_STALL)
-			libusb_clear_halt(d->h, t->endpoint);
+		/* macOS marks the pipe stalled after any error: clear it first */
+		libusb_clear_halt(d->h, t->endpoint);
 		if (*cnt < 200 && libusb_submit_transfer(t) == 0)
 			return;
 		d->xfer_err = t->status;
@@ -686,8 +686,8 @@ static void LIBUSB_CALL xfer_cb(struct libusb_transfer *t)
 			    t->status, t->endpoint);
 			dev->failed = 1;
 		}
-		if (t->status == LIBUSB_TRANSFER_STALL)
-			libusb_clear_halt(dev->h, t->endpoint);
+		/* macOS marks the pipe stalled after any error: clear it first */
+		libusb_clear_halt(dev->h, t->endpoint);
 		break;
 	}
 
